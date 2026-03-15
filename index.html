@@ -400,7 +400,7 @@ async function loadSessionInfo(sid){
 // ══════════════════════════════════════════════════════
 async function checkToken(){
   const sid = el("s-session-id").value.trim();
-  const tok = el("s-token").value.trim().toUpperCase();
+  const tok = el("s-token").value.trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
   const resEl = el("s-tok-result");
   resEl.innerHTML="";
   if(!sid){ resEl.innerHTML=alert_("warn","<span>⚠</span><span>セッションIDが必要です</span>"); return; }
@@ -464,7 +464,7 @@ async function lookupSid(){
 //  STUDENT: SUBMIT
 // ══════════════════════════════════════════════════════
 async function doSubmit(){
-  const entered = el("s-code-in").value.trim().toUpperCase();
+  const entered = el("s-code-in").value.trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
   const resEl   = el("s-submit-result");
   if(!STUDENT_SID||!STUDENT_INFO){ resEl.innerHTML=alert_("err","<span>✗</span><span>学籍番号を再入力してください</span>"); return; }
   if(entered.length!==6){ resEl.innerHTML=alert_("err","<span>✗</span><span>6文字のコードを入力してください</span>"); return; }
@@ -785,7 +785,7 @@ td{padding:10px;border-bottom:1px solid #e2e4ef;vertical-align:middle}
         <div class="mb14">
           <label class="label">セッショントークン（6文字）</label>
           <input class="input code-in" id="s-token" maxlength="6" placeholder="——————"
-            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')">
+            inputmode="latin" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
         </div>
         <button class="btn btn-ink btn-full" onclick="checkToken()">→ トークンを確認する</button>
         <div id="s-tok-result" class="mt10"></div>
@@ -822,7 +822,7 @@ td{padding:10px;border-bottom:1px solid #e2e4ef;vertical-align:middle}
         <div class="mb14">
           <label class="label">上に表示された専用コード（6文字）</label>
           <input class="input code-in" id="s-code-in" maxlength="6" placeholder="——————"
-            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')">
+            inputmode="latin" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
         </div>
         <div id="s-submit-result" class="mb14"></div>
         <button class="btn btn-green btn-full" id="submit-btn" onclick="doSubmit()">✅ 出席を登録する</button>
