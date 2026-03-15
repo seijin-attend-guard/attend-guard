@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AttendGuard</title>
+<script type="module">
+// ★ Firebase設定 ★
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, get, onValue, push, update, remove }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBNucubFiMUjK5uAnTue_sSm3mORK_cZSY",
+  authDomain: "attend-guard-40262.firebaseapp.com",
+  projectId: "attend-guard-40262",
+  storageBucket: "attend-guard-40262.firebasestorage.app",
+  messagingSenderId: "511829737335",
+  appId: "1:511829737335:web:d42cbe47f57b0b95a7eb72",
+  databaseURL: "https://attend-guard-40262-default-rtdb.firebaseio.com"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+// ══════════════════════════════════════════════════════
+//  UTILS
+// ══════════════════════════════════════════════════════
+const CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function rnd(n=6){ let s=""; for(let i=0;i<n;i++) s+=CHARS[Math.floor(Math.random()*CHARS.length)]; return s; }
+function nowStr(){ return new Date().toLocaleTimeString("ja-JP"); }
+function el(id){ return document.getElementById(id); }
+function parseRoster(txt){
+  return txt.trim().split("\n")
+    .map(l=>l.trim().split(",").map(s=>s.trim()))
+    .filter(p=>p.length>=2&&p[0])
+    .map(p=>({id:p[0], name:p.slice(1).join(" ")}));
+}
+
+// QR生成（Canvas使用・外部ライブラリ不要）
+function makeQR(text, canvas){
+  // 簡易QR代替：URLをcanvasにテキスト表示（本番はqrcode.jsを使用可）
+  const ctx = canvas.getContext("2d");
+  canvas.width=200; canvas.height=200;
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,200,200);
+  ctx.fillStyle="#1a1a2e"; ctx.font="bold 13px monospace";
+  ctx.textAlign="center";
+  // URLを分割して表示
+  const url = text;
+  const parts = [];
+  for(let i=0;i<url.length;i+=22) parts.push(url.slice(i,i+22));
+  ctx.font="10px monospace";
+  ctx.fillStyle="#555";
+  ctx.fillText("📱 このURLを開いてください",100,30);
+  ctx.fillStyle="#1a1a2e";
+  ctx.font="bold 11px monospace";
+  parts.forEach((p,i)=>ctx.fillText(p,100,60+i*18));
+  ctx.font="10px monospace"; ctx.fillStyle="#888";
+  ctx.fillText("↑ ブラウザのアドレスバーに入力",100,185);
+}
+
+// ══════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════
+let MODE = "teacher"; // teacher | student
+let SESSION_ID = null;
+let SESSION    = null;
+let TIMER_ID   = null;
+let TOKEN_EXPIRY = 0;
+let CODE_EXPIRY  = 0;
+let STUDENT_SID  = null;
+let STUDENT_INFO = null; // {name, code}
+let unsubscribe  = null; // Firebase listener
+
+// ══════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ══════════════════════════════════════════════════════
+function badge(color, text){
+  const map={green:"#dcfce7:#16a34a:rgba(22,163,74,.3)",red:"#fee2e2:#dc2626:rgba(220,38,38,.3)",
+    blue:"#dbeafe:#2563eb:rgba(37,99,235,.3)",amber:"#fef3c7:#d97706:rgba(217,119,6,.3)",
+    purple:"#ede9fe:#7c3aed:rgba(124,58,237,.3)",gray:"#f3f4f6:#6b7280:#e5e7eb"};
+  const [bg,fg,br]=map[color].split(":");
+  return `<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;
+    font-size:10px;font-weight:700;letter-spacing:.04em;
+    background:${bg};color:${fg};border:1px solid ${br}">${text}</span>`;
+}
+function alert_(type,html){
+  const map={info:"#dbeafe:#2563eb:rgba(37,99,235,.2)",ok:"#dcfce7:#16a34a:rgba(22,163,74,.2)",
+    err:"#fee2e2:#dc2626:rgba(220,38,38,.2)",warn:"#fef3c7:#d97706:rgba(217,119,6,.2)",
+    purple:"#ede9fe:#7c3aed:rgba(124,58,237,.2)"};
+  const [bg,fg,br]=map[type].split(":");
+  return `<div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;
+    font-size:12px;line-height:1.6;margin-bottom:12px;
+    background:${bg};color:${fg};border:1px solid ${br}">${html}</div>`;
+}
+
+// ══════════════════════════════════════════════════════
+//  FIREBASE OPS
+// ══════════════════════════════════════════════════════
+async function createSession(sess, roster){
+  const id = rnd(8);
+  const token = rnd(6);
+  const now = Date.now();
+  const data = {
+    name: sess.name, room: sess.room,
+    tokDur: sess.tokDur, codeDur: sess.codeDur,
+    token, tokenExpiry: now + sess.tokDur*1000,
+    codeExpiry: now + sess.codeDur*1000,
+    createdAt: now, active: true,
+    roster: Object.fromEntries(roster.map(s=>[s.id,{name:s.name,code:null,submitted:null,used:false,checkinTime:null}]))
+  };
+  await set(ref(db, `sessions/${id}`), data);
+  return {id, token, data};
+}
+
+async function rotateToken(sessionId, tokDur){
+  const token = rnd(6);
+  const expiry = Date.now() + tokDur*1000;
+  await update(ref(db,`sessions/${sessionId}`),{token, tokenExpiry: expiry});
+  return token;
+}
+
+async function issueCode(sessionId, sid){
+  const code = rnd(6);
+  await update(ref(db,`sessions/${sessionId}/roster/${sid}`),{code, issuedAt: Date.now()});
+  return code;
+}
+
+async function submitCode(sessionId, sid, entered, expected, name){
+  const match = entered === expected;
+  const t = nowStr();
+  await update(ref(db,`sessions/${sessionId}/roster/${sid}`),{
+    submitted: entered, used: true, checkinTime: t, match
+  });
+  // Add to records
+  await push(ref(db,`sessions/${sessionId}/records`),{
+    name, id: sid, submitted: entered, expected, match, time: t
+  });
+  return match;
+}
+
+async function endSession(sessionId){
+  await update(ref(db,`sessions/${sessionId}`),{active:false});
+}
+
+async function getSessionByToken(token){
+  // Find active session matching token
+  const snap = await get(ref(db,"sessions"));
+  if(!snap.exists()) return null;
+  const sessions = snap.val();
+  for(const [id,sess] of Object.entries(sessions)){
+    if(sess.active && sess.token===token && Date.now()<sess.tokenExpiry){
+      return {id, sess};
+    }
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════
+//  TEACHER: START SESSION
+// ══════════════════════════════════════════════════════
+async function startSession(){
+  const roster = parseRoster(el("roster-txt").value);
+  if(!roster.length){alert("名簿を入力してください");return;}
+  const sess = {
+    name:    el("c-name").value || "講義",
+    room:    el("c-room").value || "教室",
+    tokDur:  parseInt(el("c-tokdur").value)||30,
+    codeDur: parseInt(el("c-codedur").value)||180,
+  };
+  el("start-btn").textContent="作成中...";
+  el("start-btn").disabled=true;
+  try{
+    const {id,token,data} = await createSession(sess,roster);
+    SESSION_ID = id;
+    SESSION    = data;
+    TOKEN_EXPIRY = data.tokenExpiry;
+    CODE_EXPIRY  = data.codeExpiry;
+    showTeacherActive();
+    startTeacherTimer();
+    subscribeSession();
+    renderTokenPanel(token);
+  }catch(e){
+    alert("エラー："+e.message);
+    el("start-btn").textContent="▶ 講義を開始する";
+    el("start-btn").disabled=false;
+  }
+}
+
+function showTeacherActive(){
+  el("setup-form").style.display="none";
+  el("active-wrap").style.display="block";
+  el("a-name").textContent=SESSION.name;
+  el("a-room").textContent="📍 "+SESSION.room;
+  el("cnt-total").textContent=Object.keys(SESSION.roster||{}).length;
+  // Show session ID for student URL
+  const studentUrl = `${location.href.split("?")[0]}?session=${SESSION_ID}`;
+  el("session-url").textContent=studentUrl;
+  el("session-url-wrap").style.display="block";
+}
+
+// ══════════════════════════════════════════════════════
+//  TEACHER: REALTIME LISTENER
+// ══════════════════════════════════════════════════════
+function subscribeSession(){
+  if(unsubscribe) unsubscribe();
+  const r = ref(db,`sessions/${SESSION_ID}`);
+  unsubscribe = onValue(r, snap=>{
+    if(!snap.exists()) return;
+    SESSION = snap.val();
+    renderLiveFeed();
+    renderCodeGrid();
+    renderStats();
+  });
+}
+
+function renderStats(){
+  const roster  = SESSION.roster||{};
+  const issued  = Object.values(roster).filter(c=>c.code).length;
+  const ok      = Object.values(roster).filter(c=>c.used&&c.match).length;
+  el("cnt-issued").textContent=issued;
+  el("cnt-ok").textContent=ok;
+}
+
+function renderLiveFeed(){
+  const records = SESSION.records ? Object.values(SESSION.records).reverse() : [];
+  const feed = el("live-feed");
+  if(!records.length){feed.innerHTML='<div style="font-size:12px;color:#9898b8">まだ登録がありません</div>';return;}
+  feed.innerHTML = records.map(r=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;
+      padding:9px 12px;border-radius:7px;margin-bottom:6px;font-size:12px;
+      background:${r.match?"#dcfce7":"#fee2e2"};
+      border-left:3px solid ${r.match?"#16a34a":"#dc2626"}">
+      <div><span style="font-weight:700">${r.name}</span>
+        <span style="font-size:11px;color:#9898b8;font-family:monospace"> ${r.id}</span></div>
+      <div style="display:flex;gap:6px;align-items:center">
+        ${r.match?badge("green","✓ 一致"):badge("red","✗ 不一致")}
+        <span style="font-size:10px;color:#9898b8;font-family:monospace">${r.time}</span>
+      </div>
+    </div>`).join("");
+}
+
+function renderCodeGrid(){
+  const grid  = el("code-grid");
+  const roster = SESSION.roster||{};
+  const entries = Object.entries(roster);
+  if(!entries.length){grid.innerHTML="";return;}
+  grid.innerHTML = entries.map(([id,c])=>{
+    const cls = !c.code?"none":c.used?(c.match?"match":"miss"):"issued";
+    const borderColor = cls==="match"?"#16a34a":cls==="miss"?"#dc2626":cls==="issued"?"#2563eb":"#e2e4ef";
+    const bg = cls==="match"?"#dcfce7":cls==="miss"?"#fee2e2":"#f6f7fb";
+    const badgeHtml = !c.code?badge("gray","未認証"):c.used?(c.match?badge("green","✓ 一致"):badge("red","✗ 不一致")):badge("blue","発行済");
+    return `<div style="background:${bg};border:1.5px solid ${borderColor};border-radius:8px;padding:13px;position:relative">
+      <div style="font-size:10px;color:#9898b8;font-family:monospace;margin-bottom:2px">${id}</div>
+      <div style="font-size:13px;font-weight:700;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${c.name}</div>
+      <div style="font-family:monospace;font-size:18px;font-weight:700;letter-spacing:.14em;color:#d97706">${c.code||"──────"}</div>
+      <div style="position:absolute;top:10px;right:10px">${badgeHtml}</div>
+      ${c.used?`<div style="font-size:10px;color:#9898b8;margin-top:5px;font-family:monospace">入力: ${c.submitted}</div>`:""}
+      ${c.checkinTime?`<div style="font-size:10px;color:#9898b8;margin-top:2px;font-family:monospace">⏱ ${c.checkinTime}</div>`:""}
+    </div>`;
+  }).join("");
+}
+
+function renderCheckTab(){
+  const roster = SESSION?.roster||{};
+  const submitted = Object.entries(roster).filter(([,c])=>c.used);
+  const body = el("check-body");
+  if(!submitted.length){
+    body.innerHTML=alert_("warn","<span>⚠</span><span>出席登録が行われると表示されます</span>");return;
+  }
+  body.innerHTML = submitted.map(([id,c])=>{
+    const match=c.match;
+    return `<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #e2e4ef;flex-wrap:wrap">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:700;font-size:13px">${c.name}</div>
+        <div style="font-size:10px;color:#9898b8;font-family:monospace">${id}</div>
+      </div>
+      <span style="font-family:monospace;font-size:15px;font-weight:700;letter-spacing:.1em;color:${match?"#16a34a":"#dc2626"}">${c.submitted}</span>
+      <span style="color:#9898b8">→</span>
+      <span style="font-family:monospace;font-size:15px;font-weight:700;letter-spacing:.1em;color:#4a4a6a">${c.code}</span>
+      ${match?badge("green","✓ 一致"):badge("red","✗ 不一致")}
+    </div>`;
+  }).join("");
+}
+
+function renderLogTab(){
+  const records = SESSION?.records ? Object.values(SESSION.records) : [];
+  const tbody = el("log-tbody");
+  if(!records.length){
+    tbody.innerHTML=`<tr><td colspan="7" style="text-align:center;padding:20px;font-size:12px;color:#9898b8">記録がありません</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = records.map(r=>`<tr>
+    <td style="padding:10px;font-weight:700">${r.name}</td>
+    <td style="padding:10px;font-family:monospace;font-size:11px">${r.id}</td>
+    <td style="padding:10px;font-family:monospace;color:#d97706">${r.submitted}</td>
+    <td style="padding:10px;font-family:monospace;color:#9898b8">${r.expected}</td>
+    <td style="padding:10px">${r.match?badge("green","✓"):badge("red","✗")}</td>
+    <td style="padding:10px;font-family:monospace;font-size:11px">${r.time}</td>
+    <td style="padding:10px">${r.match?badge("green","出席"):badge("red","要確認")}</td>
+  </tr>`).join("");
+}
+
+// ══════════════════════════════════════════════════════
+//  TEACHER: TOKEN PANEL & TIMER
+// ══════════════════════════════════════════════════════
+function renderTokenPanel(token){
+  el("tok-val").textContent = token||"——————";
+  el("tok-course").textContent = SESSION?.name||"";
+  el("tok-room").textContent   = SESSION?.room||"";
+  // Render student URL QR area
+  const studentUrl = `${location.href.split("?")[0]}?session=${SESSION_ID}`;
+  el("tok-url").textContent = studentUrl;
+  el("tok-display").style.display="block";
+  el("tok-no-session").style.display="none";
+}
+
+function startTeacherTimer(){
+  clearInterval(TIMER_ID);
+  TIMER_ID = setInterval(async()=>{
+    if(!SESSION_ID||!SESSION) return;
+    const tokRem = Math.max(0, SESSION.tokenExpiry - Date.now());
+    const tokPct = tokRem / (SESSION.tokDur*1000);
+    const tokSec = Math.ceil(tokRem/1000);
+    const circum = 138.2;
+    const offset = circum*(1-tokPct);
+    const ringFg = el("ring-fg");
+    if(ringFg){
+      ringFg.style.strokeDashoffset=offset;
+      ringFg.style.stroke = tokPct>.4?"#fbbf24":tokPct>.2?"#f97316":"#ef4444";
+    }
+    const ringNum = el("ring-num");
+    if(ringNum) ringNum.textContent=tokSec;
+    if(tokRem<=0){
+      const newTok = await rotateToken(SESSION_ID, SESSION.tokDur);
+      SESSION.token=newTok;
+      SESSION.tokenExpiry=Date.now()+SESSION.tokDur*1000;
+      el("tok-val").textContent=newTok;
+    }
+  },500);
+}
+
+// ══════════════════════════════════════════════════════
+//  TEACHER: END SESSION & EXPORT
+// ══════════════════════════════════════════════════════
+async function doEndSession(){
+  if(!confirm("講義を終了しますか？")) return;
+  clearInterval(TIMER_ID);
+  if(unsubscribe) unsubscribe();
+  await endSession(SESSION_ID);
+  SESSION_ID=null; SESSION=null;
+  el("setup-form").style.display="block";
+  el("active-wrap").style.display="none";
+  el("tok-display").style.display="none";
+  el("tok-no-session").style.display="flex";
+  el("session-url-wrap").style.display="none";
+  el("start-btn").textContent="▶ 講義を開始する";
+  el("start-btn").disabled=false;
+}
+
+function exportCSV(){
+  const records = SESSION?.records ? Object.values(SESSION.records) : [];
+  const rows=["氏名,学籍番号,入力コード,発行コード,照合,時刻,判定",
+    ...records.map(r=>[r.name,r.id,r.submitted,r.expected,r.match?"一致":"不一致",r.time,r.match?"出席":"要確認"].join(","))];
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob(["\uFEFF"+rows.join("\n")],{type:"text/csv;charset=utf-8"}));
+  a.download="出席記録_"+new Date().toLocaleDateString("ja-JP").replace(/\//g,"-")+".csv";
+  a.click();
+}
+
+// ══════════════════════════════════════════════════════
+//  STUDENT: INIT (check URL param)
+// ══════════════════════════════════════════════════════
+function initStudentMode(){
+  const params = new URLSearchParams(location.search);
+  const sid = params.get("session");
+  if(sid){
+    SESSION_ID = sid;
+    el("s-session-id").value = sid;
+    loadSessionInfo(sid);
+  }
+}
+
+async function loadSessionInfo(sid){
+  const snap = await get(ref(db,`sessions/${sid}`));
+  if(!snap.exists()||!snap.val().active){
+    el("s-session-msg").innerHTML=alert_("err","<span>✗</span><span>セッションが見つからないか終了しています</span>");
+    return;
+  }
+  SESSION = snap.val();
+  el("s-course-info").innerHTML=`
+    <div style="font-weight:700;font-size:16px">${SESSION.name}</div>
+    <div style="font-size:12px;color:#9898b8;margin-top:4px">📍 ${SESSION.room}</div>`;
+  el("s-course-wrap").style.display="block";
+  el("s-step2").style.display="block";
+}
+
+// ══════════════════════════════════════════════════════
+//  STUDENT: TOKEN CHECK
+// ══════════════════════════════════════════════════════
+async function checkToken(){
+  const sid = el("s-session-id").value.trim();
+  const tok = el("s-token").value.trim().toUpperCase();
+  const resEl = el("s-tok-result");
+  resEl.innerHTML="";
+  if(!sid){ resEl.innerHTML=alert_("warn","<span>⚠</span><span>セッションIDが必要です</span>"); return; }
+  if(tok.length!==6){ resEl.innerHTML=alert_("warn","<span>⚠</span><span>6文字のトークンを入力してください</span>"); return; }
+  resEl.innerHTML=alert_("info","<span>🔄</span><span>確認中...</span>");
+  const snap = await get(ref(db,`sessions/${sid}`));
+  if(!snap.exists()||!snap.val().active){
+    resEl.innerHTML=alert_("err","<span>✗</span><span>セッションが見つからないか終了しています</span>"); return;
+  }
+  const sess = snap.val();
+  if(tok!==sess.token || Date.now()>sess.tokenExpiry){
+    resEl.innerHTML=alert_("err","<span>✗</span><span>トークンが一致しないか期限切れです。スクリーンの最新トークンを確認してください。</span>"); return;
+  }
+  SESSION=sess; SESSION_ID=sid;
+  resEl.innerHTML=alert_("ok","<span>✅</span><span>トークン確認OK！次に学籍番号を入力してください。</span>");
+  el("s-step3").style.display="block";
+}
+
+// ══════════════════════════════════════════════════════
+//  STUDENT: SID LOOKUP
+// ══════════════════════════════════════════════════════
+async function lookupSid(){
+  const sid = el("s-sid").value.trim();
+  const resEl = el("s-sid-result");
+  resEl.innerHTML="";
+  STUDENT_SID=null; STUDENT_INFO=null;
+  el("s-step4").style.display="none";
+  if(!sid) return;
+  const snap = await get(ref(db,`sessions/${SESSION_ID}/roster/${sid}`));
+  if(!snap.exists()){
+    resEl.innerHTML=alert_("err",`<span>✗</span><span>学籍番号 ${sid} は名簿に登録されていません</span>`); return;
+  }
+  const info = snap.val();
+  if(info.used){
+    resEl.innerHTML=alert_("warn","<span>⚠</span><span>この学籍番号はすでに出席登録済みです</span>"); return;
+  }
+  // Issue code
+  let code = info.code;
+  if(!code){
+    code = await issueCode(SESSION_ID, sid);
+  }
+  STUDENT_SID  = sid;
+  STUDENT_INFO = {name:info.name, code};
+  resEl.innerHTML=`
+    <div style="display:flex;align-items:center;justify-content:space-between;
+      background:#dcfce7;border:1px solid rgba(22,163,74,.3);border-radius:8px;
+      padding:12px 16px;margin-bottom:14px">
+      <div>
+        <div style="font-size:17px;font-weight:700">${info.name}</div>
+        <div style="font-size:11px;color:#4a4a6a;font-family:monospace;margin-top:2px">${sid} ／ ${SESSION.name}</div>
+      </div>
+      ${badge("green","✓ 名簿確認済")}
+    </div>`;
+  // Show personal code
+  el("s-mycode").textContent=code;
+  el("s-mycode-who").textContent=info.name+" / "+sid;
+  el("s-step4").style.display="block";
+}
+
+// ══════════════════════════════════════════════════════
+//  STUDENT: SUBMIT
+// ══════════════════════════════════════════════════════
+async function doSubmit(){
+  const entered = el("s-code-in").value.trim().toUpperCase();
+  const resEl   = el("s-submit-result");
+  if(!STUDENT_SID||!STUDENT_INFO){ resEl.innerHTML=alert_("err","<span>✗</span><span>学籍番号を再入力してください</span>"); return; }
+  if(entered.length!==6){ resEl.innerHTML=alert_("err","<span>✗</span><span>6文字のコードを入力してください</span>"); return; }
+  el("submit-btn").disabled=true;
+  el("submit-btn").textContent="登録中...";
+  const match = await submitCode(SESSION_ID, STUDENT_SID, entered, STUDENT_INFO.code, STUDENT_INFO.name);
+  if(match){
+    resEl.innerHTML=alert_("ok",`<span>✅</span><span><b>${STUDENT_INFO.name}さん</b>の出席を登録しました（${nowStr()}）</span>`);
+    el("s-step4").style.display="none";
+  } else {
+    resEl.innerHTML=alert_("err","<span>✗</span><span>コードが一致しません。STEP 3のコードを正確に入力してください。</span>");
+    el("submit-btn").disabled=false;
+    el("submit-btn").textContent="✅ 出席を登録する";
+  }
+  el("s-code-in").value="";
+}
+
+// ══════════════════════════════════════════════════════
+//  TAB & MODE SWITCHING
+// ══════════════════════════════════════════════════════
+function setMode(m){
+  MODE=m;
+  el("p-teacher").style.display=m==="teacher"?"block":"none";
+  el("p-student").style.display=m==="student"?"block":"none";
+  document.querySelectorAll(".mode-btn").forEach((b,i)=>{
+    b.classList.toggle("on",i===(m==="teacher"?0:1));
+  });
+  if(m==="student") initStudentMode();
+}
+
+function setTab(scope,id){
+  const panel=el("p-"+scope);
+  const tabs=panel.querySelectorAll(".tab");
+  const tps=panel.querySelectorAll(".tp");
+  const ids=[...tps].map(t=>t.id);
+  tabs.forEach((t,i)=>t.classList.toggle("on",ids[i]===id));
+  tps.forEach(t=>t.classList.toggle("on",t.id===id));
+  if(id==="t-check") renderCheckTab();
+  if(id==="t-log")   renderLogTab();
+  if(id==="t-codes") renderCodeGrid();
+}
+
+function copyUrl(){
+  const url=el("session-url").textContent;
+  navigator.clipboard.writeText(url).then(()=>{
+    el("copy-btn").textContent="✅ コピー済";
+    setTimeout(()=>el("copy-btn").textContent="📋 コピー",2000);
+  });
+}
+
+// Global expose
+window.startSession=startSession;
+window.doEndSession=doEndSession;
+window.exportCSV=exportCSV;
+window.setMode=setMode;
+window.setTab=setTab;
+window.checkToken=checkToken;
+window.lookupSid=lookupSid;
+window.doSubmit=doSubmit;
+window.copyUrl=copyUrl;
+
+// Init
+document.addEventListener("DOMContentLoaded",()=>{
+  const params=new URLSearchParams(location.search);
+  if(params.get("session")){
+    setMode("student");
+  }
+});
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Hiragino Kaku Gothic ProN","Meiryo",sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;font-size:14px;line-height:1.6}
+.app{max-width:960px;margin:0 auto;padding:20px 16px}
+.hdr{display:flex;align-items:center;justify-content:space-between;background:#1a1a2e;color:#fff;padding:14px 20px;border-radius:12px;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-icon{width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,.15);display:flex;align-items:center;justify-content:center;font-size:18px}
+.brand-title{font-size:17px;font-weight:700}
+.brand-sub{font-size:10px;color:rgba(255,255,255,.4);font-family:monospace;letter-spacing:.06em}
+.mode-sw{display:flex;background:rgba(255,255,255,.1);border-radius:8px;padding:3px;gap:3px}
+.mode-btn{padding:7px 16px;border:none;border-radius:6px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;color:rgba(255,255,255,.5);background:transparent;transition:all .15s}
+.mode-btn.on{background:#fff;color:#1a1a2e}
+.tabs{display:flex;border-bottom:2px solid #e2e4ef;margin-bottom:20px;overflow-x:auto}
+.tab{padding:10px 14px;border:none;background:none;font-family:inherit;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#9898b8;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s;white-space:nowrap}
+.tab.on{color:#2563eb;border-bottom-color:#2563eb}
+.panel{display:none}.panel.on{display:block}
+.tp{display:none}.tp.on{display:block}
+.card{background:#fff;border:1px solid #e2e4ef;border-radius:10px;padding:20px;margin-bottom:14px}
+.card-title{display:flex;align-items:center;justify-content:space-between;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#9898b8;margin-bottom:14px}
+.label{display:block;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#4a4a6a;margin-bottom:5px}
+.input{width:100%;padding:10px 13px;background:#f6f7fb;border:1.5px solid #e2e4ef;border-radius:7px;font-family:monospace;font-size:13px;color:#1a1a2e;outline:none;transition:border-color .15s}
+.input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+textarea.input{resize:vertical;font-size:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+@media(max-width:520px){.grid2{grid-template-columns:1fr}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 18px;border:none;border-radius:7px;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-ink{background:#1a1a2e;color:#fff}.btn-green{background:#16a34a;color:#fff}.btn-red{background:#dc2626;color:#fff}
+.btn-ghost{background:#f6f7fb;border:1.5px solid #e2e4ef;color:#4a4a6a}
+.btn-sm{padding:5px 12px;font-size:11px}.btn-full{width:100%;padding:13px}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.stat{background:#f6f7fb;border:1px solid #e2e4ef;border-radius:8px;padding:16px;text-align:center}
+.stat-n{font-family:monospace;font-size:38px;font-weight:700;line-height:1}
+.stat-l{font-size:11px;color:#9898b8;margin-top:4px}
+.tok-panel{background:#1a1a2e;border-radius:12px;padding:28px 24px;text-align:center;margin-bottom:14px;position:relative;overflow:hidden}
+.tok-panel::before{content:"";position:absolute;inset:0;background:repeating-linear-gradient(45deg,transparent,transparent 20px,rgba(255,255,255,.02) 20px,rgba(255,255,255,.02) 21px)}
+.tok-label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:rgba(255,255,255,.35);margin-bottom:16px;font-family:monospace;position:relative}
+.tok-val{font-family:monospace;font-size:52px;font-weight:700;letter-spacing:.28em;color:#fbbf24;line-height:1;position:relative}
+.tok-info{font-size:14px;font-weight:700;color:#fff;margin-top:12px;position:relative}
+.tok-sub{font-size:12px;color:rgba(255,255,255,.4);margin-top:3px;position:relative}
+.tok-timer-row{display:flex;justify-content:space-between;align-items:center;margin-top:16px;position:relative}
+.ring{position:relative;width:52px;height:52px;flex-shrink:0}
+.ring svg{transform:rotate(-90deg)}
+.ring-bg{fill:none;stroke:rgba(255,255,255,.1);stroke-width:4}
+.ring-fg{fill:none;stroke:#fbbf24;stroke-width:4;stroke-linecap:round;transition:stroke-dashoffset 1s linear,stroke .3s}
+.ring-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:monospace;font-size:13px;font-weight:700;color:#fff}
+.url-box{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 14px;margin-top:14px;position:relative}
+.url-text{font-family:monospace;font-size:11px;color:rgba(255,255,255,.7);word-break:break-all;text-align:left}
+.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;max-height:420px;overflow-y:auto}
+.mycode-panel{background:#1a1a2e;border-radius:12px;padding:28px 24px;text-align:center;margin-bottom:14px}
+.mycode-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:rgba(255,255,255,.35);margin-bottom:12px;font-family:monospace}
+.mycode-val{font-family:monospace;font-size:46px;font-weight:700;letter-spacing:.24em;color:#fbbf24;line-height:1}
+.mycode-who{font-size:12px;color:rgba(255,255,255,.45);margin-top:10px}
+.code-in{font-size:28px;text-align:center;letter-spacing:.22em;font-weight:700;color:#d97706}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px 10px;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#9898b8;border-bottom:2px solid #e2e4ef;white-space:nowrap}
+td{padding:10px;border-bottom:1px solid #e2e4ef;vertical-align:middle}
+.sep{border:none;border-top:1px solid #e2e4ef;margin:14px 0}
+.mb14{margin-bottom:14px}.mt10{margin-top:10px}.flex{display:flex;align-items:center}.gap6{gap:6px}
+.fw7{font-weight:700}.tsm{font-size:12px}.txs{font-size:11px}.tc3{color:#9898b8}.mono{font-family:monospace}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- Header -->
+<div class="hdr">
+  <div class="brand">
+    <div class="brand-icon">📋</div>
+    <div>
+      <div class="brand-title">AttendGuard</div>
+      <div class="brand-sub">Firebase連携 / リアルタイム出席管理</div>
+    </div>
+  </div>
+  <div class="mode-sw">
+    <button class="mode-btn on" onclick="setMode('teacher')">👩‍🏫 教員</button>
+    <button class="mode-btn"    onclick="setMode('student')">🎓 学生</button>
+  </div>
+</div>
+
+<!-- ═══ TEACHER ═══ -->
+<div id="p-teacher" class="panel on">
+  <div class="tabs">
+    <button class="tab on" onclick="setTab('teacher','t-setup')">① 講義設定</button>
+    <button class="tab"    onclick="setTab('teacher','t-token')">② トークン表示</button>
+    <button class="tab"    onclick="setTab('teacher','t-codes')">③ コード一覧</button>
+    <button class="tab"    onclick="setTab('teacher','t-check')">④ 照合確認</button>
+    <button class="tab"    onclick="setTab('teacher','t-log')">⑤ 出席記録</button>
+  </div>
+
+  <!-- ① Setup -->
+  <div id="t-setup" class="tp on">
+    <div class="card" id="setup-form">
+      <div class="card-title">講義情報・受講者名簿</div>
+      <div class="grid2">
+        <div><label class="label">講義名</label><input class="input" id="c-name" value="情報工学概論"></div>
+        <div><label class="label">教室</label><input class="input" id="c-room" value="A棟 201号室"></div>
+      </div>
+      <div class="grid2">
+        <div><label class="label">トークン更新間隔（秒）</label><input class="input mono" id="c-tokdur" type="number" value="30" min="15" max="120"></div>
+        <div><label class="label">個別コード有効時間（秒）</label><input class="input mono" id="c-codedur" type="number" value="180" min="60" max="600"></div>
+      </div>
+      <div class="mb14">
+        <label class="label">受講者名簿（学籍番号,氏名）</label>
+        <textarea class="input" id="roster-txt" rows="8" placeholder="2024001,山田 太郎&#10;2024002,鈴木 花子">2024001,山田 太郎
+2024002,鈴木 花子
+2024003,田中 健
+2024004,佐藤 美咲
+2024005,伊藤 優</textarea>
+      </div>
+      <button class="btn btn-green btn-full" id="start-btn" onclick="startSession()">▶ 講義を開始する</button>
+    </div>
+
+    <div id="active-wrap" style="display:none">
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div>
+            <div class="fw7" style="font-size:18px" id="a-name"></div>
+            <div class="tsm tc3 mt10" id="a-room"></div>
+          </div>
+          <div class="flex gap6">
+            <span style="display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#16a34a;border:1px solid rgba(22,163,74,.3)">● LIVE</span>
+            <button class="btn btn-red btn-sm" onclick="doEndSession()">■ 終了</button>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="stat-n" style="color:#2563eb" id="cnt-issued">0</div><div class="stat-l">コード発行済</div></div>
+          <div class="stat"><div class="stat-n" style="color:#16a34a" id="cnt-ok">0</div><div class="stat-l">照合OK</div></div>
+          <div class="stat"><div class="stat-n" style="color:#9898b8" id="cnt-total">0</div><div class="stat-l">登録者数</div></div>
+        </div>
+
+        <!-- セッションURL共有 -->
+        <div id="session-url-wrap" style="display:none;margin-bottom:14px">
+          <label class="label">学生共有URL（QRコードにして投影してください）</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <div class="input mono tsm" style="flex:1;word-break:break-all;min-height:40px;padding:10px 13px;background:#f6f7fb;border:1.5px solid #e2e4ef;border-radius:7px" id="session-url"></div>
+            <button class="btn btn-ghost btn-sm" id="copy-btn" onclick="copyUrl()">📋 コピー</button>
+          </div>
+          <div style="font-size:11px;color:#9898b8;margin-top:5px">💡 このURLをQRコード生成サービス（qr.quel.jp 等）でQR化してスクリーンに表示してください</div>
+        </div>
+
+        <button class="btn btn-ink" style="width:100%" onclick="setTab('teacher','t-token')">→ トークン表示画面へ</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span>リアルタイム出席</span><span style="display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;background:#dcfce7;color:#16a34a;border:1px solid rgba(22,163,74,.3)">● LIVE</span></div>
+        <div id="live-feed"><div class="tsm tc3">まだ登録がありません</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ② Token -->
+  <div id="t-token" class="tp">
+    <div id="tok-no-session" style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;margin-bottom:12px;background:#fef3c7;color:#d97706;border:1px solid rgba(217,119,6,.2)">
+      <span>⚠</span><span>講義を開始するとトークンが表示されます</span>
+    </div>
+    <div id="tok-display" style="display:none">
+      <div class="tok-panel">
+        <div class="tok-label">— セッショントークン（学生に入力させてください）—</div>
+        <div class="tok-val" id="tok-val">——————</div>
+        <div class="tok-info" id="tok-course"></div>
+        <div class="tok-sub"  id="tok-room"></div>
+        <div class="tok-timer-row">
+          <div style="text-align:left">
+            <div style="font-size:12px;font-weight:700;color:#fff">秒後に自動更新</div>
+            <div style="font-size:10px;color:rgba(255,255,255,.4);margin-top:1px">古いトークンは無効</div>
+          </div>
+          <div class="ring">
+            <svg width="52" height="52" viewBox="0 0 52 52">
+              <circle class="ring-bg" cx="26" cy="26" r="22"/>
+              <circle class="ring-fg" id="ring-fg" cx="26" cy="26" r="22" stroke-dasharray="138.2" stroke-dashoffset="0"/>
+            </svg>
+            <div class="ring-text" id="ring-num">30</div>
+          </div>
+        </div>
+        <!-- URLも表示 -->
+        <div class="url-box">
+          <div style="font-size:10px;color:rgba(255,255,255,.35);font-family:monospace;margin-bottom:4px">学生アクセスURL</div>
+          <div class="url-text" id="tok-url"></div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;margin-bottom:12px;background:#ede9fe;color:#7c3aed;border:1px solid rgba(124,58,237,.2)">
+        <span>🔐</span><span><b>代理入力対策：</b>トークンは自動更新。QRスキャン後に各学生へ固有コードが発行されます。</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ③ Codes -->
+  <div id="t-codes" class="tp">
+    <div class="card">
+      <div class="card-title">学生別 個別コード（Firebaseリアルタイム同期）</div>
+      <div id="code-grid" class="cgrid"><div class="tsm tc3">講義を開始するとコードが表示されます</div></div>
+    </div>
+  </div>
+
+  <!-- ④ Check -->
+  <div id="t-check" class="tp">
+    <div class="card">
+      <div class="card-title">コード照合結果</div>
+      <div id="check-body"><div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;background:#fef3c7;color:#d97706;border:1px solid rgba(217,119,6,.2)"><span>⚠</span><span>出席登録が行われると表示されます</span></div></div>
+    </div>
+  </div>
+
+  <!-- ⑤ Log -->
+  <div id="t-log" class="tp">
+    <div class="card">
+      <div class="card-title"><span>出席記録</span><button class="btn btn-ghost btn-sm" onclick="exportCSV()">📥 CSV出力</button></div>
+      <div style="overflow-x:auto">
+        <table><thead><tr>
+          <th>氏名</th><th>学籍番号</th><th>入力コード</th><th>発行コード</th><th>照合</th><th>時刻</th><th>判定</th>
+        </tr></thead><tbody id="log-tbody"></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ STUDENT ═══ -->
+<div id="p-student" class="panel">
+  <div class="tabs">
+    <button class="tab on" onclick="setTab('student','s-main')">出席登録</button>
+  </div>
+  <div id="s-main" class="tp on">
+
+    <!-- Session info (auto-filled from URL) -->
+    <div id="s-course-wrap" style="display:none;margin-bottom:14px">
+      <div class="card" style="padding:16px">
+        <div id="s-course-info"></div>
+      </div>
+    </div>
+    <div id="s-session-msg"></div>
+
+    <!-- STEP 1: セッションID（URL経由で自動入力） -->
+    <div class="card">
+      <div class="card-title">STEP 1 — セッションへ接続</div>
+      <div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;margin-bottom:14px;background:#dbeafe;color:#2563eb;border:1px solid rgba(37,99,235,.2)">
+        <span>🔗</span><span>教員がスクリーンに表示したQRをスキャンすると自動で接続されます。URLから開いた場合はそのまま進んでください。</span>
+      </div>
+      <div class="mb14" style="display:none">
+        <label class="label">セッションID（URLから自動入力）</label>
+        <input class="input mono" id="s-session-id" placeholder="セッションID">
+      </div>
+      <div id="s-step2" style="display:none">
+        <!-- STEP 2: トークン -->
+        <div class="sep"></div>
+        <div class="card-title" style="margin-bottom:10px">STEP 2 — トークンを入力</div>
+        <div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;margin-bottom:14px;background:#dbeafe;color:#2563eb;border:1px solid rgba(37,99,235,.2)">
+          <span>🔑</span><span>教員のスクリーンに表示されている<b>6文字のトークン</b>を入力してください。</span>
+        </div>
+        <div class="mb14">
+          <label class="label">セッショントークン（6文字）</label>
+          <input class="input code-in" id="s-token" maxlength="6" placeholder="——————"
+            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')">
+        </div>
+        <button class="btn btn-ink btn-full" onclick="checkToken()">→ トークンを確認する</button>
+        <div id="s-tok-result" class="mt10"></div>
+      </div>
+    </div>
+
+    <!-- STEP 3: 学籍番号 -->
+    <div class="card" id="s-step3" style="display:none">
+      <div class="card-title">STEP 3 — 学籍番号を入力</div>
+      <div class="mb14">
+        <label class="label">学籍番号</label>
+        <input class="input mono" id="s-sid" placeholder="例：2024001" maxlength="12"
+          style="font-size:22px;text-align:center;letter-spacing:.1em;font-weight:700"
+          oninput="lookupSid()">
+      </div>
+      <div id="s-sid-result"></div>
+    </div>
+
+    <!-- STEP 4: 個別コード表示・入力 -->
+    <div id="s-step4" style="display:none">
+      <div class="card">
+        <div class="card-title">STEP 4 — あなたの専用コード</div>
+        <div class="mycode-panel">
+          <div class="mycode-label">YOUR PERSONAL CODE</div>
+          <div class="mycode-val" id="s-mycode">——————</div>
+          <div class="mycode-who" id="s-mycode-who"></div>
+        </div>
+        <div style="display:flex;align-items:flex-start;gap:9px;padding:11px 14px;border-radius:7px;font-size:12px;margin-bottom:14px;background:#fef3c7;color:#d97706;border:1px solid rgba(217,119,6,.2)">
+          <span>⚠</span><span>このコードはあなただけのものです。他の人と共有すると<b>代理入力として記録</b>されます。</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">STEP 5 — コードを入力して出席登録</div>
+        <div class="mb14">
+          <label class="label">上に表示された専用コード（6文字）</label>
+          <input class="input code-in" id="s-code-in" maxlength="6" placeholder="——————"
+            oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')">
+        </div>
+        <div id="s-submit-result" class="mb14"></div>
+        <button class="btn btn-green btn-full" id="submit-btn" onclick="doSubmit()">✅ 出席を登録する</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</div><!-- /app -->
+</body>
+</html>
